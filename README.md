@@ -3,7 +3,9 @@
 Restores shell **path auto-completion** in Windows file dialogs, and suppresses
 the text-suggestion popup over the filename box.
 
-Built for Windows 11 **10.0.29648.1000** (Canary), 2026-09-14.
+Works in both the legacy **Open** dialog and the modern **Save As**
+(`IFileDialog`). Analysed and verified on Windows 11 **10.0.29648.1000**
+(Canary), 2026-09-14.
 
 ---
 
@@ -24,8 +26,8 @@ if (hwndDropDown == 0 || _IsComboboxDropped(this) || (flags & 0x40) != 0)
     return;                                             // refuses to show
 ```
 
-That guard exists so autocomplete gets out of the way of a **CJK IME candidate
-list**. Windows 11 delivers ordinary text suggestions through the *same*
+That guard exists so autocomplete steps aside for a **CJK IME candidate list**.
+Windows 11 delivers ordinary text suggestions through the *same*
 candidate-window channel, so typing a path raises `IMN_OPENCANDIDATE` over and
 over — measured at **16 times across a 7-character path**. Each one hides the
 dropdown and blocks it from returning.
@@ -46,43 +48,58 @@ if (GetComboBoxInfo(v27, &pcbi) && pcbi.hwndItem != nullptr)
 `comdlg32` never makes that call for its filename box — it does not even import
 `SetInputScope`. Supplying the missing call from this hook was **tested and
 returns `S_OK` while changing nothing**: `IS_FILE_FULLFILEPATH` does not
-suppress the predictor on this build. Whatever protects the Run dialog, it is
-not (only) the input scope.
+suppress the predictor on this build.
 
-Also note: `msctf!SetInputScope` refuses cross-thread callers —
+`msctf!SetInputScope` also refuses cross-thread callers —
 
 ```c
 if (GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId()) { ... }
 return -2147024809;   // 0x80070057 E_INVALIDARG
 ```
 
-so no external utility can set it on another app's window. That is why this is
-a hook and not a standalone program.
+— so no external utility can set it on another app's window. Hence a hook.
 
 ## What this does
 
-A global `WH_CBT` hook. On `HCBT_SETFOCUS` (which fires *before* focus is
-assigned), if the window is a file dialog filename edit
-(`Edit < ComboBox < ComboBoxEx32 < #32770`):
+A global `WH_CBT` hook.
 
-1. **Subclass it** and drop `WM_IME_NOTIFY`/`IMN_OPENCANDIDATE`, so bit `0x40`
-   is never set → **the dropdown survives**.
-2. **`ImmAssociateContext(hwnd, NULL)`** → no candidate session can attach →
-   **no suggestion popup**.
+1. **At `HCBT_SETFOCUS`** — subclass any `Edit` inside a `#32770`. Deliberately
+   broad; subclassing is harmless and the real decision is deferred.
+2. **At `WM_SETFOCUS` / first keystroke** — decide whether the dialog is a file
+   dialog, and if so `ImmAssociateContext(hwnd, NULL)` so no candidate session
+   can attach → **no suggestion popup**.
+3. **On `WM_IME_NOTIFY`/`IMN_OPENCANDIDATE`** — drop it for file dialogs so bit
+   `0x40` is never set → **the dropdown survives**.
 
 Documented APIs only. No binary patching, no hardcoded offsets, so a Windows
 update will not break it the way a `shell32` patch would.
+
+### Timing is the whole problem
+
+Identifying the dialog is only possible in a narrow window:
+
+| Moment | Result |
+|---|---|
+| `HCBT_SETFOCUS` | Modern `IFileDialog` is not built yet — unrecognisable |
+| First `IMN_OPENCANDIDATE` | A suggestion has already shown; detaching is too late |
+| **`WM_SETFOCUS` / first keystroke** | Dialog complete, ~160ms ahead of the suggestion |
+
+A negative answer at `WM_SETFOCUS` is **not** cached — it may only mean the
+dialog is still constructing — so the check repeats on the first keystroke.
+
+### Detection notes
+
+- The legacy dialog exposes comdlg32 control IDs (`cmb13` 1148, `edt1` 1152,
+  `cmb1` 1136); the **modern `IFileDialog` exposes none of them** — its controls
+  sit inside DirectUI containers with ID `0`. It is identified by a
+  `DUIViewWndClassName` / `SHELLDLL_DefView` descendant instead.
+- `FindWindowEx` only walks **immediate** children; the shell view is several
+  levels down, so the search must recurse (`EnumChildWindows`).
 
 ### Trade-off
 
 CJK IME composition is disabled **in the filename box only**. Every other
 control on the system is untouched.
-
-### Detection note
-
-Do **not** identify the dialog by probing for `DUIViewWndClassName` or
-`SHELLDLL_DefView`. At `HCBT_SETFOCUS` time the shell view does not exist yet,
-so the probe always fails. The control shape alone is the reliable signal.
 
 ---
 
@@ -93,13 +110,30 @@ so the probe always fails. The control shape alone is the reliable signal.
 | `pathscope_x64.dll` / `pathscope_x86.dll` | the hook |
 | `pshostw_x64.exe` / `pshostw_x86.exe` | windowless host (autostart) |
 | `pshost_x64.exe` / `pshost_x86.exe` | console host (testing; Ctrl+C to stop) |
-| `pathscope.c`, `pshost.c`, `pshostw.c` | source |
-| `arch.cmd`, `buildall.cmd` | build scripts (needs VS 2026 + Win SDK) |
+| `pathscope.c`, `pshost.c`, `pshostw.c`, `pathscope.def` | source |
+| `CMakeLists.txt`, `deploy.ps1` | build and deploy |
 
-Both architectures are needed: a global hook only injects into processes of
-matching bitness.
+Both architectures are required: a global hook only injects into processes of
+matching bitness. The x86 build **needs `pathscope.def`** — without it
+`__stdcall` decoration exports `_CbtProc@16` and `GetProcAddress` fails with
+error 127.
 
-## Control
+## Build
+
+```powershell
+cmake -B build/x64 -A x64   -S . ; cmake --build build/x64 --config Release
+cmake -B build/x86 -A Win32 -S . ; cmake --build build/x86 --config Release
+```
+
+Requires Visual Studio 2026 + Windows SDK. The hook links the **static CRT** so
+its imports stay `user32` + `kernel32` only — it is injected into every GUI
+process and must not need redistributable runtime DLLs.
+
+## Install
+
+`deploy.ps1` (elevated) copies to `C:\Tools\pathscope` and hash-verifies every
+file. A loaded DLL cannot be overwritten but *can* be renamed, so it renames the
+old one aside first.
 
 ```powershell
 # status
@@ -112,25 +146,23 @@ taskkill /IM pshostw_x64.exe /IM pshostw_x86.exe
 C:\Tools\pathscope\pshostw_x64.exe pathscope_x64.dll
 C:\Tools\pathscope\pshostw_x86.exe pathscope_x86.dll
 
-# remove autostart entirely
+# remove autostart
 Unregister-ScheduledTask -TaskName 'pathscope (x64)' -Confirm:$false
 Unregister-ScheduledTask -TaskName 'pathscope (x86)' -Confirm:$false
 ```
 
-Diagnostic log: `%TEMP%\pathscope.log` (one line per control it acts on).
+Diagnostic log: `%TEMP%\pathscope.log`.
 
 ## Limits
 
 - Does not reach **elevated** apps unless the host itself runs elevated.
 - Only while running — no hook, no fix.
-- Detection targets the shell file dialog shape; custom dialogs that merely
-  look similar are not affected.
+- Covers shell file dialogs; apps with custom-drawn pickers that bypass
+  comdlg32 are unaffected.
+- The Browse-For-Folder dialog (`SHBrowseForFolder`) and Explorer's address bar
+  are **not** covered — different control layouts, not yet investigated.
 
-## Rebuilding
+## Status
 
-```cmd
-buildall.cmd
-```
-
-Requires Visual Studio 2026 (`vcvars64.bat` / `vcvarsamd64_x86.bat`) and the
-Windows SDK. Adjust `VSROOT` in `arch.cmd` if VS moves.
+This is a workaround for a Microsoft regression. The proper fix belongs in
+`comdlg32`/`shell32`. Not yet reported upstream.

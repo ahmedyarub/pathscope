@@ -96,41 +96,138 @@ static BOOL ClassIs(HWND h, const WCHAR *want)
     return lstrcmpiW(buf, want) == 0;
 }
 
-/*
- * The filename box of both the modern and legacy shell file dialogs is
- *      Edit  <  ComboBox  <  ComboBoxEx32  <  #32770
- * A ComboBoxEx32 inside a dialog is, in practice, only this control (and the
- * Run dialog's, which shell32 already protects - acting on it is harmless).
- *
- * Note: probing for DUIViewWndClassName / SHELLDLL_DefView does NOT work here.
- * At HCBT_SETFOCUS time the shell view does not exist yet, so the probe always
- * fails and the control is never matched.
- */
-static BOOL IsFileDialogEdit(HWND h)
+/* comdlg32 control IDs (dlgs.h) */
+#define ID_CMB13  1148   /* cmb13 - filename combo (Open)            */
+#define ID_EDT1   1152   /* edt1  - filename edit  (Save As, legacy) */
+#define ID_CMB1   1136   /* cmb1  - file type combo                  */
+
+typedef struct { const WCHAR *cls; BOOL found; } FINDCTX;
+
+static BOOL CALLBACK FindChildProc(HWND h, LPARAM lp)
 {
-    HWND parent;
+    FINDCTX *c = (FINDCTX *)lp;
+    if (ClassIs(h, c->cls)) { c->found = TRUE; return FALSE; }
+    return TRUE;
+}
 
+/* FindWindowEx only walks immediate children; the shell view sits several
+   levels down, so recurse. */
+static BOOL HasDescendantOfClass(HWND root, const WCHAR *cls)
+{
+    FINDCTX c;
+    c.cls = cls; c.found = FALSE;
+    if (root) EnumChildWindows(root, FindChildProc, (LPARAM)&c);
+    return c.found;
+}
+
+/*
+ * Is this dialog a shell file dialog?
+ *
+ * MUST be evaluated lazily, not at HCBT_SETFOCUS: at focus time the dialog is
+ * not fully built, so every probe below fails. The legacy dialog exposes
+ * comdlg32 control IDs; the modern IFileDialog exposes none of them (its
+ * controls live inside DirectUI containers with ID 0) and is identified by its
+ * shell view instead.
+ */
+static BOOL IsFileDialogRoot(HWND root)
+{
+    if (!ClassIs(root, L"#32770")) return FALSE;
+
+    if (GetDlgItem(root, ID_CMB13) ||
+        GetDlgItem(root, ID_EDT1)  ||
+        GetDlgItem(root, ID_CMB1)) return TRUE;                 /* legacy */
+
+    if (HasDescendantOfClass(root, L"DUIViewWndClassName")) return TRUE; /* modern */
+    if (HasDescendantOfClass(root, L"SHELLDLL_DefView"))    return TRUE;
+
+    return FALSE;
+}
+
+/*
+ * Candidate at focus time: any Edit inside a dialog. Deliberately broad -
+ * subclassing is harmless, and the real decision is deferred to the first
+ * IMN_OPENCANDIDATE, by which time the dialog is complete and can be
+ * identified reliably.
+ */
+static BOOL IsCandidateEdit(HWND h)
+{
     if (!ClassIs(h, L"Edit")) return FALSE;
-
-    parent = GetParent(h);
-    if (ClassIs(parent, L"ComboBox")) parent = GetParent(parent);
-    if (!ClassIs(parent, L"ComboBoxEx32")) return FALSE;
-
     return ClassIs(GetAncestor(h, GA_ROOT), L"#32770");
 }
 
 /* ------------------------------------------------- fix 1: keep the dropdown */
+static void ApplyDetachIme(HWND h);          /* forward decl */
+
+static const WCHAR PROP_VERDICT[] = L"PathScope.Verdict";
+#define VERDICT_FILEDLG  ((HANDLE)(ULONG_PTR)1)
+#define VERDICT_OTHER    ((HANDLE)(ULONG_PTR)2)
+
+/*
+ * Decide whether this edit belongs to a file dialog, and if so detach its IME
+ * context immediately.
+ *
+ * Timing matters twice over:
+ *  - Too early (HCBT_SETFOCUS) the modern IFileDialog is not built yet, so it
+ *    cannot be recognised at all.
+ *  - Too late (first IMN_OPENCANDIDATE) a suggestion has already been shown,
+ *    and detaching at that point no longer suppresses the UI.
+ * The first keystroke is the sweet spot: the dialog is complete, and it is
+ * ~160ms ahead of the suggestion the predictor raises for that keystroke.
+ *
+ * allowNegative=FALSE means "don't cache a NO yet" - used on WM_SETFOCUS,
+ * where a NO may only mean the dialog is still being constructed.
+ */
+static HANDLE EnsureVerdict(HWND h, BOOL allowNegative)
+{
+    HANDLE verdict = GetPropW(h, PROP_VERDICT);
+    HWND   root;
+    BOOL   isFd;
+
+    if (verdict) return verdict;
+
+    root = GetAncestor(h, GA_ROOT);
+    isFd = IsFileDialogRoot(root);
+
+    if (isFd) {
+        SetPropW(h, PROP_VERDICT, VERDICT_FILEDLG);
+        Log("VERDICT %p filedialog=1", (void *)h);
+        ApplyDetachIme(h);
+        return VERDICT_FILEDLG;
+    }
+    if (allowNegative) {
+        SetPropW(h, PROP_VERDICT, VERDICT_OTHER);
+        Log("VERDICT %p filedialog=0", (void *)h);
+        return VERDICT_OTHER;
+    }
+    return NULL;                        /* undecided; ask again later */
+}
+
 static LRESULT CALLBACK ScopeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old = (WNDPROC)GetPropW(h, PROP_OLDPROC);
 
-    if (msg == WM_IME_NOTIFY_ && wp == IMN_OPENCANDIDATE_)
-        return 0;                       /* never reaches CAutoComplete */
+    switch (msg) {
+    case WM_SETFOCUS:
+        EnsureVerdict(h, FALSE);        /* act early when already detectable */
+        break;
+    case WM_CHAR:
+    case WM_KEYDOWN:
+        EnsureVerdict(h, TRUE);         /* dialog is certainly built by now   */
+        break;
+    default:
+        break;
+    }
+
+    if (msg == WM_IME_NOTIFY_ && wp == IMN_OPENCANDIDATE_) {
+        if (EnsureVerdict(h, TRUE) == VERDICT_FILEDLG)
+            return 0;                   /* never reaches CAutoComplete */
+    }
 
     if (msg == WM_NCDESTROY) {
         if (old) SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
         RemovePropW(h, PROP_OLDPROC);
         RemovePropW(h, PROP_OLDIMC);
+        RemovePropW(h, PROP_VERDICT);
     }
     return old ? CallWindowProcW(old, h, msg, wp, lp) : DefWindowProcW(h, msg, wp, lp);
 }
@@ -171,12 +268,18 @@ static void ApplyDetachIme(HWND h)
 /* ------------------------------------------------------------------- hook */
 __declspec(dllexport) LRESULT CALLBACK CbtProc(int code, WPARAM wParam, LPARAM lParam)
 {
-    /* HCBT_SETFOCUS fires before focus is assigned, so we are in place early. */
+    /*
+     * Subclass broadly at focus time (any Edit in a dialog) and let ScopeProc
+     * decide whether this is really a file dialog once a suggestion actually
+     * fires - at which point the dialog is fully constructed. Identifying it
+     * here does not work: at HCBT_SETFOCUS the modern IFileDialog has no shell
+     * view yet and exposes none of comdlg32's control IDs.
+     */
     if (code == HCBT_SETFOCUS) {
         HWND h = (HWND)wParam;
-        if (h && !GetPropW(h, PROP_OLDPROC) && IsFileDialogEdit(h)) {
+        if (h && !GetPropW(h, PROP_OLDPROC) && IsCandidateEdit(h)) {
+            Log("HOOK %p editId=%d", (void *)h, GetDlgCtrlID(h));
             ApplySwallow(h);
-            ApplyDetachIme(h);
         }
     }
     return CallNextHookEx(NULL, code, wParam, lParam);
