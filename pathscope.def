@@ -1,0 +1,6 @@
+; Export the hook procedure with an undecorated name.
+; Without this, the x86 build exports _CbtProc@16 (stdcall decoration) and
+; GetProcAddress(dll, "CbtProc") fails with ERROR_PROC_NOT_FOUND (127).
+LIBRARY
+EXPORTS
+    CbtProc

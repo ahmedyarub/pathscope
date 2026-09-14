@@ -1,0 +1,20 @@
+# build output
+build/
+cmake-build-*/
+out/
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# IDE
+.idea/
+.vs/
+*.user
+
+# logs
+pathscope.log
+install.log
