@@ -14,6 +14,45 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#ifdef _WIN64
+#define ARCH "x64"
+#else
+#define ARCH "x86"
+#endif
+
+/* Appends "HOST <arch> ..." to the same %TEMP%\pathscope.log the hook writes,
+   so each sign-in shows whether the hook was actually installed. */
+static void HostLog(const char *fmt, ...)
+{
+    WCHAR      path[MAX_PATH];
+    char       buf[512];
+    DWORD      n, wrote;
+    int        m;
+    HANDLE     f;
+    va_list    ap;
+    SYSTEMTIME st;
+
+    n = GetTempPathW(MAX_PATH, path);
+    if (n == 0 || n > MAX_PATH - 20) return;
+    lstrcatW(path, L"pathscope.log");
+
+    GetLocalTime(&st);
+    m = wsprintfA(buf, "%04u-%02u-%02u %02u:%02u:%02u.%03u %5lu HOST " ARCH " | ",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                  st.wMilliseconds, GetCurrentProcessId());
+    va_start(ap, fmt);
+    m += wvsprintfA(buf + m, fmt, ap);
+    va_end(ap);
+    if (m > (int)sizeof(buf) - 2) m = (int)sizeof(buf) - 2;
+    buf[m] = '\r'; buf[m + 1] = '\n'; m += 2;
+
+    f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    WriteFile(f, buf, (DWORD)m, &wrote, NULL);
+    CloseHandle(f);
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
 {
     HMODULE  dll;
@@ -34,8 +73,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
 #else
     lstrcpyW(mutexName, L"Local\\pathscope.host.x86");
 #endif
+    HostLog("start");
     mutex = CreateMutexW(NULL, TRUE, mutexName);
-    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        HostLog("another host already running - exiting");
+        return 0;
+    }
 
     /* Resolve the DLL next to this executable. */
     n = GetModuleFileNameW(NULL, path, MAX_PATH);
@@ -59,13 +102,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
     }
 
     dll = LoadLibraryW(path);
-    if (!dll) return 1;
+    if (!dll) { HostLog("FAILED LoadLibrary %S err=%lu", path, GetLastError()); return 1; }
 
     proc = (HOOKPROC)GetProcAddress(dll, "CbtProc");
-    if (!proc) return 1;
+    if (!proc) { HostLog("FAILED GetProcAddress(CbtProc) err=%lu", GetLastError()); return 1; }
 
     hook = SetWindowsHookExW(WH_CBT, proc, dll, 0);
-    if (!hook) return 1;
+    if (!hook) { HostLog("FAILED SetWindowsHookEx err=%lu", GetLastError()); return 1; }
+    HostLog("hook installed (%S)", path);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -73,5 +117,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
     }
 
     UnhookWindowsHookEx(hook);
+    HostLog("message loop ended - hook removed, exiting");
     return 0;
 }

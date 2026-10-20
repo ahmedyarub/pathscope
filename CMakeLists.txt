@@ -48,6 +48,10 @@ add_executable(pshostw WIN32 pshostw.c)
 set_target_properties(pshostw PROPERTIES OUTPUT_NAME "pshostw_${PS_ARCH}")
 target_link_libraries(pshostw PRIVATE user32)
 
+# --- test harness: the shell folder picker (what Electron apps open) ------
+add_executable(pickfolder WIN32 test/pickfolder.c)
+target_link_libraries(pickfolder PRIVATE ole32 uuid)
+
 install(TARGETS pathscope pshost pshostw
         RUNTIME DESTINATION .
         LIBRARY DESTINATION .)

@@ -3,9 +3,10 @@
 Restores shell **path auto-completion** in Windows file dialogs, and suppresses
 the text-suggestion popup over the filename box.
 
-Works in both the legacy **Open** dialog and the modern **Save As**
-(`IFileDialog`). Analysed and verified on Windows 11 **10.0.29648.1000**
-(Canary), 2026-09-14.
+Works in the **Open** and **Save As** dialogs and the **folder picker**
+(`IFileOpenDialog` + `FOS_PICKFOLDERS`, which Electron apps such as Claude
+Desktop use). Analysed on Windows 11 **10.0.29648.1000** (2026-09-14) and
+**10.0.29683.1000** (2026-10-20).
 
 ---
 
@@ -36,56 +37,81 @@ It fires **even when no suggestion is displayed**: merely opening the candidate
 session is enough. That is why the dropdown vanishes even when nothing appears
 on screen.
 
+## The suggestion popup
+
+The strip of word suggestions (`geri · guri · Geri` over `e:\gdri`) does **not**
+come from the edit's IMM context or its TSF document. A call-stack capture of
+the `IMN_OPENCANDIDATE` that reaches the edit shows the sender:
+
+```
+USER32!SendMessageW <- textinputframework!CUIElementAdapter::OpenCandidateListUI
+  <- CUIElementAdapter::OnCandidateMessage <- CInputContextAdapter::OnCandidateMessage
+  <- CTSF3CandidateMessage::Execute <- ... (same thread, not a cross-thread send)
+```
+
+`textinputframework.dll` (TSF3) receives the candidate list from
+`TextInputHost.exe`, which draws the strip, and notifies `GetFocus()` itself.
+Detaching the IME (`ImmAssociateContext(hwnd, NULL)`) or TSF
+(`ITfThreadMgr::AssociateFocus(hwnd, NULL)`) therefore changes nothing — both
+were tested on 29683 and removed.
+
+What TSF3 *does* honour is `TextInputClient::IsPrivateField`:
+
+```c
+if ((info->flags & 0xC0000) != 0) return 1;
+scope = info->inputScope;                  // from the edit's own input context
+if (scope - 31 <= 0x22 && _bittest64(&0x740000001, scope - 31)) return 1;  // 31 = IS_PASSWORD, 61, 63-65
+return scope == 66;
+```
+
+A private field gets no suggestions at all. The scope is read from the edit's
+own input context (`GUID_PROP_INPUTSCOPE`, which `msctf!SetInputScope` feeds),
+but `IsPrivateField` runs only in `EditControlFocusChangeInternal` — **as focus
+enters the edit**. Setting the scope at `WM_SETFOCUS` is already too late.
+
 ## What does not work
 
-`shell32!CRunDlg::InitRunDlg` protects the Run dialog:
+- **`IS_FILE_FULLFILEPATH`** — what `shell32!CRunDlg::InitRunDlg` sets on the
+  Run dialog. `comdlg32` never sets it; supplying it returns `S_OK` and changes
+  nothing.
+- **Detaching the IME or TSF** — see above. Worse, with the IME detached TSF3
+  falls back to a context whose scope the hook does not own, so the private
+  scope is ignored.
+- **`IS_PASSWORD` at `WM_SETFOCUS`** — TSF3 has already recorded the edit as
+  not private for that focus session.
+- **Stripping `ISC_SHOWUIALL`** from `WM_IME_SETCONTEXT` — no effect.
 
-```c
-if (GetComboBoxInfo(v27, &pcbi) && pcbi.hwndItem != nullptr)
-    SetInputScope(pcbi.hwndItem, IS_FILE_FULLFILEPATH);
-```
-
-`comdlg32` never makes that call for its filename box — it does not even import
-`SetInputScope`. Supplying the missing call from this hook was **tested and
-returns `S_OK` while changing nothing**: `IS_FILE_FULLFILEPATH` does not
-suppress the predictor on this build.
-
-`msctf!SetInputScope` also refuses cross-thread callers —
-
-```c
-if (GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId()) { ... }
-return -2147024809;   // 0x80070057 E_INVALIDARG
-```
-
-— so no external utility can set it on another app's window. Hence a hook.
+`msctf!SetInputScope` refuses cross-thread callers (`E_INVALIDARG`), so no
+external utility can set it on another app's window. Hence a hook.
 
 ## What this does
 
 A global `WH_CBT` hook.
 
-1. **At `HCBT_SETFOCUS`** — subclass any `Edit` inside a `#32770`. Deliberately
-   broad; subclassing is harmless and the real decision is deferred.
-2. **At `WM_SETFOCUS` / first keystroke** — decide whether the dialog is a file
-   dialog, and if so `ImmAssociateContext(hwnd, NULL)` so no candidate session
-   can attach → **no suggestion popup**.
-3. **On `WM_IME_NOTIFY`/`IMN_OPENCANDIDATE`** — drop it for file dialogs so bit
-   `0x40` is never set → **the dropdown survives**.
+1. **At `HCBT_SETFOCUS`** — just before focus moves — subclass any `Edit`
+   inside a `#32770`, decide whether it is a file dialog, and if so
+   `SetInputScope(hwnd, IS_PASSWORD)` → TSF3 marks the filename box private →
+   **no suggestions, no candidate session**.
+2. **On `WM_IME_NOTIFY`/`IMN_OPENCANDIDATE`** — drop it for file dialogs so bit
+   `0x40` is never set → **the dropdown survives** any candidate session that
+   still opens (a CJK IME, say).
+3. **Stay in front of autocomplete** — in the folder picker, autocomplete
+   subclasses the edit *after* focus and lands in front of the hook, seeing
+   `IMN_OPENCANDIDATE` first. When that happens a second, minimal layer is put
+   on top. One layer only.
 
 Documented APIs only. No binary patching, no hardcoded offsets, so a Windows
 update will not break it the way a `shell32` patch would.
 
-### Timing is the whole problem
-
-Identifying the dialog is only possible in a narrow window:
+### Timing
 
 | Moment | Result |
 |---|---|
-| `HCBT_SETFOCUS` | Modern `IFileDialog` is not built yet — unrecognisable |
-| First `IMN_OPENCANDIDATE` | A suggestion has already shown; detaching is too late |
-| **`WM_SETFOCUS` / first keystroke** | Dialog complete, ~160ms ahead of the suggestion |
+| **`HCBT_SETFOCUS`** | Open / Save / folder picker expose comdlg32 IDs → recognised; scope set before TSF3 evaluates the field |
+| `WM_SETFOCUS` / first keystroke | Fallback for a dialog not built yet: the dropdown fix still applies; the scope takes effect from the next focus entry |
 
-A negative answer at `WM_SETFOCUS` is **not** cached — it may only mean the
-dialog is still constructing — so the check repeats on the first keystroke.
+A negative answer before the first keystroke is **not** cached — it may only
+mean the dialog is still constructing.
 
 ### Detection notes
 
@@ -98,8 +124,10 @@ dialog is still constructing — so the check repeats on the first keystroke.
 
 ### Trade-off
 
-CJK IME composition is disabled **in the filename box only**. Every other
-control on the system is untouched.
+To the input stack the filename box is a password field: **no text
+suggestions and no CJK composition there**. The text itself is displayed
+normally and autocomplete is unaffected. Every other control on the system is
+untouched.
 
 ---
 
@@ -112,6 +140,7 @@ control on the system is untouched.
 | `pshost_x64.exe` / `pshost_x86.exe` | console host (testing; Ctrl+C to stop) |
 | `pathscope.c`, `pshost.c`, `pshostw.c`, `pathscope.def` | source |
 | `CMakeLists.txt`, `deploy.ps1` | build and deploy |
+| `test/pickfolder.c` | test harness: opens the folder picker (`pickfolder`) or file picker (`pickfolder file`) |
 
 Both architectures are required: a global hook only injects into processes of
 matching bitness. The x86 build **needs `pathscope.def`** — without it
@@ -146,12 +175,32 @@ taskkill /IM pshostw_x64.exe /IM pshostw_x86.exe
 C:\Tools\pathscope\pshostw_x64.exe pathscope_x64.dll
 C:\Tools\pathscope\pshostw_x86.exe pathscope_x86.dll
 
+# Running apps keep the DLL they already loaded until they restart: Windows
+# matches a loaded module by path, even after the file was renamed. To apply a
+# new build to running apps immediately, start the hosts on a fresh file name:
+#   copy pathscope_x64.dll pathscope_x64.new.dll ; pshostw_x64.exe pathscope_x64.new.dll
+
 # remove autostart
 Unregister-ScheduledTask -TaskName 'pathscope (x64)' -Confirm:$false
 Unregister-ScheduledTask -TaskName 'pathscope (x86)' -Confirm:$false
 ```
 
-Diagnostic log: `%TEMP%\pathscope.log`.
+Diagnostic log: `%TEMP%\pathscope.log` (rotates to `.old` at 2 MB). Every line
+has a timestamp, PID and exe name:
+
+| Line | Meaning |
+|---|---|
+| `HOST x64 \| hook installed` | the host started and the hook is live (one per sign-in, per arch) |
+| `HOST ... FAILED ...` | the host could not install the hook - nothing is fixed |
+| `HOOK` / `SUBCLASS` | an `Edit` in a `#32770` got focus and was subclassed |
+| `VERDICT ... filedialog=1 at=<when> by=<probe>` | recognised as a file dialog; `at=cbt` means before focus arrived |
+| `PRIVATE-SCOPE ... hr=` | `SetInputScope(IS_PASSWORD)` result |
+| `TOP ... re-layered` | autocomplete attached after the hook; second layer put in front |
+| `DIAG` / `PROPS` | per-keystroke state of a file-dialog edit (capped): `outer`, `imc`, dropdown `dd=count/visible` |
+| `STACK` | a candidate session opened on a file-dialog edit anyway — who sent it |
+| `VERDICT ... filedialog=0` | judged not a file dialog, with the dialog's class and title |
+| `PASS-CANDIDATE` | a suggestion session opened on an edit judged *not* a file dialog - a misjudged file dialog shows up here |
+| `SKIP` | an `Edit` outside a `#32770` got focus - not handled (once per window) |
 
 ## Limits
 
